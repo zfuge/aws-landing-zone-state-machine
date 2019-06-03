@@ -18,6 +18,8 @@ from lib.service_catalog import ServiceCatalog as SC
 from lib.scp import ServiceControlPolicy as SCP
 from lib.directory_service import DirectoryService
 from lib.cloudformation import StackSet, Stacks
+from lib.assume_role_helper import AssumeRole
+from lib.s3 import S3
 from lib.metrics import Metrics
 from lib.ssm import SSM
 from lib.ec2 import EC2
@@ -31,8 +33,9 @@ import inspect
 import time
 import os
 import json
-from lib.helper import sanitize
-import random
+from lib.helper import sanitize, convert_http_url_to_s3_url
+import tempfile
+import filecmp
 
 
 class CloudFormation(object):
@@ -116,33 +119,6 @@ class CloudFormation(object):
 
             operation_status = response.get('StackSetOperation', {}).get('Status')
             self.event.update({'OperationStatus': operation_status})
-
-            if operation_status == 'SUCCEEDED' or operation_status == 'FAILED' or operation_status == 'STOPPED':
-                account_to_policies_map = self.event.get('AccountToPoliciesAttachedMap', {})
-
-                scp = SCP(self.logger)
-                for account, policy_id_list in account_to_policies_map.items():
-                    for policy_id in policy_id_list:
-                        self.logger.info("Attaching policy:{} to account: {}".format(policy_id, account))
-
-                        for count in range(3):
-                            try:
-                                scp.attach_policy(policy_id, account)
-                                break
-                            except ClientError as e:
-                                if e.response['Error']['Code'] == 'ConcurrentModificationException':
-                                    if count > 2:
-                                        raise
-                                    else:
-                                        self.logger.exception("Caught exception 'ConcurrentModificationException', retrying...")
-                                        i = random.randrange(1,10)
-                                        time.sleep(i)
-                                        continue
-                                else:
-                                    message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
-                                               'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
-                                    self.logger.exception(message)
-                                    raise
 
             return self.event
         except Exception as e:
@@ -350,8 +326,6 @@ class CloudFormation(object):
             else:
                 region_list = self.params.get('RegionList')
 
-            self._detach_scp()
-
             # Create stack instances
             stack_set = StackSet(self.logger)
 
@@ -385,8 +359,6 @@ class CloudFormation(object):
             self.logger.info(self.params)
             stack_set = StackSet(self.logger)
 
-            self._detach_scp()
-
             # Update existing StackSet
             self.logger.info("Updating Stack Set: {}".format(self.params.get('StackSetName')))
 
@@ -417,7 +389,6 @@ class CloudFormation(object):
             stack_set = StackSet(self.logger)
             override_parameters = self.params.get('ParameterOverrides') # this should come from the event
             self.logger.info("override_params_list={}".format(override_parameters))
-            self._detach_scp()
 
             response = stack_set.update_stack_instances(self.params.get('StackSetName'),
                                                         self.params.get('AccountList'),
@@ -468,8 +439,6 @@ class CloudFormation(object):
             else:
                 region_list = self.params.get('RegionList')
 
-            self._detach_scp()
-
             # Delete stack_set_instance(s)
             stack_set = StackSet(self.logger)
             self.logger.info("Deleting Stack Instance: {}".format(self.params.get('StackSetName')))
@@ -489,61 +458,10 @@ class CloudFormation(object):
             gf.send_failure_to_cfn()
             raise
 
-    def _detach_scp(self):
-        if self.event.get('StackInstanceAccountList', []):
-            accounts = self.event.get('StackInstanceAccountList')
-        else:
-            accounts = self.params.get('AccountList')
-
-        self.logger.info("Detaching SCPs for accounts: {}".format(accounts))
-        # Detach ALL SCPs and save the list of policy ids for every account for reattaching at the end of deletion
-        account_to_policies_map = {}
-        scp = SCP(self.logger)
-        for account in accounts:
-            pages = scp.list_policies_for_account(account)
-
-            policy_id_list = []
-            for page in pages:
-                policies_list = page.get('Policies')
-
-                # iterate through the policies list
-                for policy in policies_list:
-                    policy_id = policy.get('Id')
-                    policy_name = policy.get('Name')
-
-                    # Special allowance for FullAWSAccess SCP policy, if you detach that you can't do anything in the account :(
-                    if 'fullawsaccess' not in policy_name.lower():
-                        self.logger.info("Detaching SCP policy:{} from account: {}".format(policy_id, account))
-
-                        for count in range(3):
-                            try:
-                                scp.detach_policy(policy_id, account)
-                                policy_id_list.append(policy_id)
-                                break
-                            except ClientError as e:
-                                if e.response['Error']['Code'] == 'ConcurrentModificationException':
-                                    if count > 2:
-                                        raise
-                                    else:
-                                        self.logger.exception("Caught exception 'ConcurrentModificationException', retrying...")
-                                        i = random.randrange(1,10)
-                                        time.sleep(i)
-                                        continue
-                                else:
-                                    message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
-                                               'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
-                                    self.logger.exception(message)
-                                    raise
-
-            account_to_policies_map.update({account: policy_id_list})
-
-        self.event.update({'AccountToPoliciesAttachedMap': account_to_policies_map})
-
-
 class Organizations(object):
     def __init__(self, event, logger):
         self.event = event
-        self.params = event.get('ResourceProperties')
+        self.params = event.get('ResourceProperties', {})
         self.logger = logger
         self.logger.info("Organization Event")
         self.logger.info(event)
@@ -590,6 +508,75 @@ class Organizations(object):
             gf.send_failure_to_cfn()
             raise
 
+    def _strip_list_items(self, array):
+        return [item.strip() for item in array]
+
+    def _remove_empty_strings(self, array):
+        return [x for x in array if x != '']
+
+    def _list_sanitizer(self, array):
+        stripped_array = self._strip_list_items(array)
+        return self._remove_empty_strings(stripped_array)
+
+    def _empty_seperator_handler(self, delimiter, nested_ou_name):
+        if delimiter == "":
+            nested_ou_name_list = [nested_ou_name]
+        else:
+            nested_ou_name_list = nested_ou_name.split(delimiter)
+        return nested_ou_name_list
+
+    def get_ou_id(self, nested_ou_name, delimiter):
+        try:
+            org = Org(self.logger)
+            response = org.list_roots()
+            root_id = response['Roots'][0].get('Id')
+            self.logger.info("Organizations Root Id: {}".format(root_id))
+            self.logger.info("Looking up the OU Id for OUName: {} with nested ou delimiter: {}".format(nested_ou_name, delimiter))
+            return self._get_ou_id(org, root_id, nested_ou_name, delimiter)
+        except Exception as e:
+            message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
+                       'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
+            self.logger.exception(message)
+            gf = GeneralFunctions(self.event, self.logger)
+            gf.send_failure_to_cfn()
+            raise
+
+    def _get_ou_id(self, org, parent_id, nested_ou_name, delimiter):
+        try:
+            nested_ou_name_list = self._empty_seperator_handler(delimiter, nested_ou_name)
+            response = self._list_ou_for_parent(org, parent_id, self._list_sanitizer(nested_ou_name_list))
+            self.logger.info(response)
+            return response
+        except Exception as e:
+            message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
+                       'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
+            self.logger.exception(message)
+            gf = GeneralFunctions(self.event, self.logger)
+            gf.send_failure_to_cfn()
+            raise
+
+    def _list_ou_for_parent(self, org, parent_id, nested_ou_name_list):
+        try:
+            ou_list = org.list_organizational_units_for_parent(parent_id)
+            index = 0  # always process the first item
+            self.logger.info("Looking for existing OU: {} under parent id: {}".format(nested_ou_name_list[index], parent_id))
+            for dictionary in ou_list:
+                if dictionary.get('Name') == nested_ou_name_list[index]:
+                    self.logger.info("OU Name: {} exists under parent id: {}".format(dictionary.get('Name'), parent_id))
+                    nested_ou_name_list.pop(index) # pop the first item in the list
+                    if len(nested_ou_name_list) == 0:
+                        self.logger.info("Returning last level OU ID: {}".format(dictionary.get('Id')))
+                        return dictionary.get('Id')
+                    else:
+                        return self._list_ou_for_parent(org, dictionary.get('Id'), nested_ou_name_list)
+        except Exception as e:
+            message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
+                       'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
+            self.logger.exception(message)
+            gf = GeneralFunctions(self.event, self.logger)
+            gf.send_failure_to_cfn()
+            raise
+
     def check_organization_unit(self):
         try:
             self.logger.info("Executing: " + self.__class__.__name__ + "/" + inspect.stack()[0][3])
@@ -599,32 +586,82 @@ class Organizations(object):
                 self.logger.info("Root ID is 'None', skip API call, return OUId = 'None'")
                 self.event.update({'OUNextToken': 'Complete'})
             else:
-                if self.event.get('OUNextToken') is not None:
-                    self.logger.info('NEXT TOKEN')
-                    response = org.list_organizational_units_for_parent(ParentId=self.event.get('RootId'),
-                                                                        NextToken=self.event.get('OUNextToken'))
+                self.logger.info("Executing: " + self.__class__.__name__ + "/" + inspect.stack()[0][3])
+                self.logger.info(self.params)
+                parent_id = self.event.get('RootId')
+                nested_ou_name = self.params.get('OUName')
+                self.logger.info(nested_ou_name)
+                delimiter = self.params.get('OUNameDelimiter')
+                ou_id = self._get_ou_id(org, parent_id, nested_ou_name, delimiter)
+                if isinstance(ou_id, str):
+                    self.logger.info("Last Level OU ID: {}".format(ou_id))
+                    self.event.update({'OUId': ou_id})
+                    return self.event
                 else:
-                    self.logger.info('NO NEXT TOKEN')
-                    response = org.list_organizational_units_for_parent(ParentId=self.event.get('RootId'))
-
-                self.logger.info("Response: List Org Units for Root ID")
-                self.logger.info(response)
-                self.logger.info("Next Token Returned: {}".format(response.get('NextToken')))
-                if response.get('OrganizationalUnits'):
-                    for ou in response.get('OrganizationalUnits'):
-                        if ou.get('Name') == self.params.get('OUName'):
-                            ou_id = ou.get('Id')
-                            self.event.update({'OUId': ou_id})
-                            self.event.update({'OUNextToken': 'Complete'})
-                            return self.event
-                else:
-                    self.logger.info("Empty OU list returned.")
-                if response.get('NextToken') is None:
-                    self.event.update({'OUNextToken': 'Complete'})
-                else:
-                    self.event.update({'OUNextToken': response.get('NextToken')})
+                    self.logger.info("OU ID for the last OU not found")
             self.event.update({'OUId': 'None'})
             return self.event
+        except Exception as e:
+            message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
+                       'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
+            self.logger.exception(message)
+            gf = GeneralFunctions(self.event, self.logger)
+            gf.send_failure_to_cfn()
+            raise
+
+    def _create_nested_ou(self, org, parent_id, nested_ou_name, delimiter):
+        try:
+            self.logger.info("Executing: " + self.__class__.__name__ + "/" + inspect.stack()[0][3])
+            self.logger.info(self.params)
+            nested_ou_name_list = self._empty_seperator_handler(delimiter, nested_ou_name)
+            response = self._create_child_ou(org, parent_id, self._list_sanitizer(nested_ou_name_list))
+            self.logger.info("Destination OU ID: {}".format(response))
+            return response
+        except Exception as e:
+            message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
+                       'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
+            self.logger.exception(message)
+            gf = GeneralFunctions(self.event, self.logger)
+            gf.send_failure_to_cfn()
+            raise
+
+    def _create_child_ou(self, org, parent_id, nested_ou_name_list):
+        try:
+            self.logger.info("Parent ID: {}".format(parent_id))
+            self.logger.info("Nested OU List: {}".format(nested_ou_name_list))
+            last_level_ou_id = self._list_ou_for_parent(org, parent_id, nested_ou_name_list.copy())
+            self.logger.info("Existing OU ID: {}".format(last_level_ou_id))
+            index = 0
+            if last_level_ou_id is not None:
+                parent_id = last_level_ou_id
+                self.logger.info("Last Level OU ID: {}".format(last_level_ou_id))
+                return parent_id
+            else:
+                self.logger.info("Nested OU List: {}".format(nested_ou_name_list))
+                self.logger.info("OU: {} does not exist under parent id: {}, creating now..."
+                                 .format(nested_ou_name_list[index], parent_id))
+                response_create_ou = org.create_organizational_unit(parent_id, nested_ou_name_list[index])
+                # handle exception: duplicate child OU name under same parent OU
+                if response_create_ou.get('Error') == 'DuplicateOrganizationalUnitException':
+                    self.logger.info('OU already exist, updating parent id')
+                    self.logger.info("Parent ID: {}".format(parent_id))
+                    # if exists then list to obtain the OU id
+                    parent_id = self._list_ou_for_parent(org, parent_id, [nested_ou_name_list[index]])
+                    self.logger.info("Updated Parent ID: {}".format(parent_id))
+                # update parent OU id
+                else:
+                    self.logger.info("New OU Created successfully")
+                    parent_id = response_create_ou.get('OrganizationalUnit').get('Id')
+                    self.logger.info("Updated Parent ID: {}".format(parent_id))
+                # remove first OU name in the list, to process next OU in the list
+                nested_ou_name_list.pop(index)
+                self.logger.info("Updated Nested OU List: {}".format(nested_ou_name_list))
+                # if this is the last level nested OU then return the OU ID else callback
+                if len(nested_ou_name_list) == 0:
+                    self.logger.info("All nested OUs created, returning: {}".format(parent_id))
+                    return parent_id
+                self.logger.info("Callback Create Function")
+                return self._create_child_ou(org, parent_id, nested_ou_name_list)
         except Exception as e:
             message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
                        'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
@@ -638,10 +675,12 @@ class Organizations(object):
             self.logger.info("Executing: " + self.__class__.__name__ + "/" + inspect.stack()[0][3])
             self.logger.info(self.params)
             org = Org(self.logger)
-            response = org.create_organizational_unit(self.event.get('RootId'), self.params.get('OUName'))
-            self.logger.info("Response: Create Org Unit")
-            self.logger.info(response)
-            ou_id = response.get('OrganizationalUnit', {}).get('Id')
+            parent_id = self.event.get('RootId')
+            nested_ou_name = self.params.get('OUName')
+            self.logger.info("Creating Nested OUs: {}".format(nested_ou_name))
+            delimiter = self.params.get('OUNameDelimiter')
+            ou_id = self._create_nested_ou(org, parent_id, nested_ou_name, delimiter)
+            self.logger.info("Nested OU structure created, returning destination OU ID: {} (last level).".format(ou_id))
             self.event.update({'OUId': ou_id})
             return self.event
         except Exception as e:
@@ -840,35 +879,33 @@ class Organizations(object):
             raise
 
     def _update_child_account_trust_relationship(self, account, principal_arns):
-        sts = STS(self.logger)
+        try:
+            region = os.environ.get('AWS_REGION')
 
-        region = os.environ.get('AWS_DEFAULT_REGION')
+            _assume_role = AssumeRole()
+            iam = IAM(self.logger, region, credentials=_assume_role(self.logger, account))
 
-        role_arn = "arn:aws:iam::" + str(account) + ":role/AWSCloudFormationStackSetExecutionRole"
-        session_name = "lock_down_stack_sets_role"
+            principals = principal_arns.split(",")
+            principals = [p.strip() for p in principals]
 
-        # assume role
-        credentials = sts.assume_role(role_arn, session_name)
-        self.logger.info("Assuming IAM role: {}".format(role_arn))
+            policy_doc = {}
+            policy_stmt = {}
+            policy_doc.update({'Version': '2012-10-17'})
+            policy_stmt.update({'Effect': 'Allow'})
+            policy_stmt.update({"Action": "sts:AssumeRole"})
+            policy_stmt.update({"Principal": {'AWS': principals}})
+            policy_doc.update({"Statement": [policy_stmt]})
+            self.logger.info("Applying policy: {} for account ID: {}".format(json.dumps(policy_doc), account))
 
-        # instantiate EC2 class using temporary security credentials
-        self.logger.info("Updating the assume_role_policy for account ID: {}".format(account))
-        iam = IAM(self.logger, region, credentials=credentials)
-
-        principals = principal_arns.split(",")
-        principals = [p.strip() for p in principals]
-
-        policy_doc = {}
-        policy_stmt = {}
-        policy_doc.update({'Version': '2012-10-17'})
-        policy_stmt.update({'Effect': 'Allow'})
-        policy_stmt.update({"Action": "sts:AssumeRole"})
-        policy_stmt.update({"Principal": {'AWS': principals}})
-        policy_doc.update({"Statement": [policy_stmt]})
-        self.logger.info("Applying policy: {} for account ID: {}".format(json.dumps(policy_doc), account))
-
-        iam.update_assume_role_policy('AWSCloudFormationStackSetExecutionRole', json.dumps(policy_doc))
-        time.sleep(5)
+            iam.update_assume_role_policy('AWSCloudFormationStackSetExecutionRole', json.dumps(policy_doc))
+            time.sleep(5)
+        except Exception as e:
+            message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
+                       'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
+            self.logger.exception(message)
+            gf = GeneralFunctions(self.event, self.logger)
+            gf.send_failure_to_cfn()
+            raise
 
     def lock_down_stack_sets_role(self):
         try:
@@ -1596,6 +1633,14 @@ class ServiceCatalog(object):
             self.event.update({'DeleteOldestArtifact': value})
             self.event.update({'ExistingLatestVersion': existing_latest_version})
 
+            # get the artifact ID of existing latest version
+            if len(version_list) >= 1:
+                for item in response.get('ProvisioningArtifactDetails', {}):
+                    if item.get('Name') == existing_latest_version:
+                        self.event.update({'ExistingLatestArtifactId': item.get('Id')})
+            else:
+                self.event.update({'ExistingLatestArtifactId': "None"})
+
             # get the artifact ID of 'latest - 1' version
             if product_event.get('HideOldVersions').lower() == 'yes' and len(version_list) >= 1:
                 for item in response.get('ProvisioningArtifactDetails', {}):
@@ -1610,6 +1655,87 @@ class ServiceCatalog(object):
             gf = GeneralFunctions(self.event, self.logger)
             gf.send_failure_to_cfn()
             raise
+
+    def _download_remote_file(self, remote_s3_path):
+        try:
+            _file = tempfile.mkstemp()[1]
+            t = remote_s3_path.split("/", 3) # s3://bucket-name/key
+            remote_bucket = t[2] # Bucket name
+            remote_key = t[3] # Key
+            self.logger.info("Downloading {}/{} from S3 to {}".format(remote_bucket, remote_key, _file))
+            s3 = S3(self.logger)
+            s3.download_file(remote_bucket, remote_key, _file)
+            return _file
+        except Exception as e:
+            message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
+                       'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
+            self.logger.exception(message)
+            gf = GeneralFunctions(self.event, self.logger)
+            gf.send_failure_to_cfn()
+            raise
+
+    def _rewrite_file_with_invert_match(self, local_old_template_file, old_template_file, exclude_key):
+        try:
+            with open(old_template_file, 'w') as new_file:
+                for line in open(local_old_template_file):
+                    if exclude_key not in line:
+                        new_file.write(line)
+        except Exception as e:
+            message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
+                       'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
+            self.logger.exception(message)
+            gf = GeneralFunctions(self.event, self.logger)
+            gf.send_failure_to_cfn()
+            raise
+
+    def compare_product_templates(self):
+        try:
+            self.logger.info("Executing: " + self.__class__.__name__ + "/" + inspect.stack()[0][3])
+            self.logger.info(self.params)
+            sc = SC(self.logger)
+            product_id = self.event.get('ProductId')
+            artifact_id = self.event.get('ExistingLatestArtifactId')
+
+            # download new template file
+            new_template_http_url = self.params.get('SCProduct', {}).get('ProvisioningArtifactParameters').get('Info').get('LoadTemplateFromURL')
+            new_template_s3_url = convert_http_url_to_s3_url(new_template_http_url)
+            local_new_template_file = self._download_remote_file(new_template_s3_url)
+
+            # download existing template file
+            response_describe_artifact = sc.describe_provisioning_artifact(product_id, artifact_id)
+            old_template_http_url = response_describe_artifact.get('Info').get('TemplateUrl')
+            old_template_s3_url = convert_http_url_to_s3_url(old_template_http_url)
+            local_old_template_file = self._download_remote_file(old_template_s3_url)
+
+            old_template_file = tempfile.mkstemp()[1] # [1] == os.path.abspath(file)
+            new_template_file = tempfile.mkstemp()[1]
+
+            # before file comparision remove lines that begins with 'key:'
+            # why? to avoid false negative because this line contains UUID that will always show up in file diff
+            exclude = 'key:'
+            self._rewrite_file_with_invert_match(local_old_template_file, old_template_file, exclude)
+            self._rewrite_file_with_invert_match(local_new_template_file, new_template_file, exclude)
+
+            # set boolean value - if matches set to True else False
+            templates_matching = filecmp.cmp(new_template_file, old_template_file, False)
+
+            self.logger.info("templates_matching={}".format(templates_matching))
+
+            # update event to skip artifact creation workflow
+            if templates_matching:
+                self.logger.info("No changes made in the AVM template, skipping new artifact (version) creation")
+                self.event.update({'CreateNewArtifact': "no"})
+            else:
+                self.event.update({'CreateNewArtifact': "yes"})
+            return self.event
+        except Exception as e:
+            message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
+                       'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
+            self.logger.exception(message)
+            gf = GeneralFunctions(self.event, self.logger)
+            gf.send_failure_to_cfn()
+            raise
+
 
     def describe_provisioning_artifact(self):
         try:
@@ -1761,7 +1887,7 @@ class ServiceCatalog(object):
             params_list = []
             for key, value in product_params.items():
                 param = {}
-                # In some wierd cases, AccountName comes back as '' for the AWS Organizations Master account
+                # In some weird cases, AccountName comes back as '' for the AWS Organizations Master account
                 value = "Primary" if key == 'AccountName' and value == "" else value
                 param.update({"Key": key})
                 param.update({"Value": value})
@@ -1774,7 +1900,7 @@ class ServiceCatalog(object):
 
             # Provision SC product
             self.logger.info("Provisioning Service Catalog Product")
-            # Sanitize the account name and ou name
+            # Sanitize the account name and OU name
             provisioned_product_name = sanitize("%s_%s_%s_%s" % ('lz', ou_name, account_name,
                                                                  time.strftime("%Y-%m-%dT%H-%M-%S")))
 
@@ -1961,10 +2087,13 @@ class ServiceCatalog(object):
                 param = {}
                 value = "Primary" if key == 'AccountName' and value == "" else value
                 param.update({"Key": key})
-                if key in existing_parameter_keys:
+                # Use previous value for all parameters except OrgUnitName
+                # Use the current OU that account belongs to in Organizations
+                if key in existing_parameter_keys and key != 'OrgUnitName':
                     param.update({"UsePreviousValue": True})
                 else:
                     param.update({"Value": value})
+
                 params_list.append(param)
 
             self.logger.info("params_list={}".format(params_list))
@@ -2134,13 +2263,16 @@ class ServiceControlPolicy(object):
         try:
             self.logger.info("Executing: " + self.__class__.__name__ + "/" + inspect.stack()[0][3])
             self.logger.info(self.params)
-            account_id = self.params.get('AccountId')
+            if self.params.get('AccountId') == "":
+                target_id = self.event.get('OUId')
+            else:
+                target_id = self.params.get('AccountId')
             policy_id = self.event.get('PolicyId')
             scp = SCP(self.logger)
-            response = scp.attach_policy(policy_id, account_id)
+            response = scp.attach_policy(policy_id, target_id)
             self.logger.info("Attach Policy Response")
             self.logger.info(response)
-            status = 'Policy: {} attached successfully to Account: {}'.format(policy_id, account_id)
+            status = 'Policy: {} attached successfully to Target: {}'.format(policy_id, target_id)
             self.event.update({'Status': status})
             return self.event
 
@@ -2156,16 +2288,59 @@ class ServiceControlPolicy(object):
         try:
             self.logger.info("Executing: " + self.__class__.__name__ + "/" + inspect.stack()[0][3])
             self.logger.info(self.params)
-            account_id = self.params.get('AccountId')
+            if self.params.get('AccountId') == "":
+                target_id = self.event.get('OUId')
+            else:
+                target_id = self.params.get('AccountId')
             policy_id = self.event.get('PolicyId')
             scp = SCP(self.logger)
-            response = scp.detach_policy(policy_id, account_id)
+            response = scp.detach_policy(policy_id, target_id)
             self.logger.info("Detach Policy Response")
             self.logger.info(response)
-            status = 'Policy: {} detached successfully from Account: {}'.format(policy_id, account_id)
+            status = 'Policy: {} detached successfully from Target: {}'.format(policy_id, target_id)
             self.event.update({'Status': status})
             return self.event
 
+        except Exception as e:
+            message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
+                       'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
+            self.logger.exception(message)
+            gf = GeneralFunctions(self.event, self.logger)
+            gf.send_failure_to_cfn()
+            raise
+
+    def list_policies_for_ou(self):
+        try:
+            self.logger.info("Executing: " + self.__class__.__name__ + "/" + inspect.stack()[0][3])
+            self.logger.info(self.params)
+            ou_name = self.event.get('OUName')
+            delimiter = self.params.get('OUNameDelimiter')
+            policy_name = self.params.get('PolicyDocument').get('Name')
+
+            # Check if SCP already exist
+            scp = SCP(self.logger)
+            organizations = Organizations(self.event, self.logger)
+
+            ou_id = organizations.get_ou_id(ou_name, delimiter)
+            self.event.update({'OUId': ou_id})
+            pages = scp.list_policies_for_target(ou_id)
+
+            for page in pages:
+                policies_list = page.get('Policies')
+
+                # iterate through the policies list
+                for policy in policies_list:
+                    if policy.get('Name') == policy_name:
+                        self.logger.info("Policy Found")
+                        self.event.update({'PolicyId': policy.get('Id')})
+                        self.event.update({'PolicyArn': policy.get('Arn')})
+                        self.event.update({'PolicyAttached': "yes"})
+                        return self.event
+                    else:
+                        continue
+
+            self.event.update({'PolicyAttached': "no"})
+            return self.event
         except Exception as e:
             message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
                        'METHOD': inspect.stack()[0][3], 'EXCEPTION': str(e)}
@@ -2183,7 +2358,7 @@ class ServiceControlPolicy(object):
 
             # Check if SCP already exist
             scp = SCP(self.logger)
-            pages = scp.list_policies_for_account(account_id)
+            pages = scp.list_policies_for_target(account_id)
 
             for page in pages:
                 policies_list = page.get('Policies')
@@ -2437,15 +2612,8 @@ class GeneralFunctions(object):
             self.logger.info("stack_name={}".format(stack_name))
 
             # instantiate STS class
-            sts = STS(self.logger)
-            role_arn = "arn:aws:iam::" + str(account) + ":role/AWSCloudFormationStackSetExecutionRole"
-            session_name = "describe_stacks_role"
-            # assume role
-            credentials = sts.assume_role(role_arn, session_name)
-            self.logger.info("Assuming IAM role: {}".format(role_arn))
-
-            self.logger.info("Creating CFN Session in {} for account: {}".format(region, account))
-            cfn = Stacks(self.logger, credentials=credentials, region=region)
+            _assume_role = AssumeRole()
+            cfn = Stacks(self.logger, credentials=_assume_role(self.logger, account), region=region)
 
             response = cfn.describe_stacks(stack_name)
             stacks = response.get('Stacks')
@@ -2479,18 +2647,41 @@ class GeneralFunctions(object):
 
             sts = STS(self.logger)
             account = self.event.get('AccountId')
-            region = os.environ.get('AWS_DEFAULT_REGION')
+            region = os.environ.get('AWS_REGION')
 
             role_arn = "arn:aws:iam::" + str(account) + ":role/AWSCloudFormationStackSetExecutionRole"
             session_name = "check_account_creation_role"
 
             # assume role
-            credentials = sts.assume_role(role_arn, session_name)
+            credentials = sts.assume_role_new_account(role_arn, session_name)
             self.logger.info("Assuming IAM role: {}".format(role_arn))
 
-            # instantiate EC2 class using temporary security credentials
-            self.logger.info("Validating account initialization, ID: {}".format(account))
-            ec2 = EC2(self.logger, region, credentials=credentials)
+            if credentials.get('Error') is not None:
+                self.event.update({'AccountInitialized': "no"})
+                self.event.update({'Error': 'AWS STS AssumeRole Failure: Access Denied.'})
+                return self.event
+            else:
+                # instantiate EC2 class using temporary security credentials
+                self.logger.info("Validating account initialization, ID: {}".format(account))
+                ec2 = EC2(self.logger, region, credentials=credentials)
+
+                try:
+                    # Checking if EC2 Service Initialized
+                    response = ec2.describe_regions()
+                    self.logger.info('EC2 DescribeRegion Response')
+                    self.logger.info(response)
+
+                    # If API call succeeds
+                    self.logger.info('Account Initialized')
+                    self.event.update({'AccountInitialized': "yes"})
+                    return self.event
+                except Exception as e:
+                    # If API call fails
+                    self.logger.error('Error: {}'.format(e))
+                    self.logger.error('Account still initializing, waiting for the Organization State Machine to retry...')
+                    self.event.update({'AccountInitialized': "no"})
+                    self.event.update({'Error': 'An error occurred when calling the DescribeRegions operation.'})
+                    return self.event
 
         except Exception as e:
             message = {'FILE': __file__.split('/')[-1], 'CLASS': self.__class__.__name__,
@@ -2499,24 +2690,6 @@ class GeneralFunctions(object):
             gf = GeneralFunctions(self.event, self.logger)
             gf.send_failure_to_cfn()
             raise
-
-        try:
-            # Checking if EC2 Service Initialized
-            response = ec2.describe_regions()
-            self.logger.info('EC2 DescribeRegion Response')
-            self.logger.info(response)
-            self.logger.info(type(response))
-
-            # If API call succeeds
-            self.logger.info('Account Initialized')
-            self.event.update({'AccountInitialized': "yes"})
-            return self.event
-        except Exception as e:
-            # If API call fails
-            self.logger.error('Error: {}'.format(e))
-            self.logger.error('Account still initializing, waiting for the Organization State Machine to retry...')
-            self.event.update({'AccountInitialized': "no"})
-            return self.event
 
     def nested_dictionary_iteration(self, dictionary):
         for key, value in dictionary.items():

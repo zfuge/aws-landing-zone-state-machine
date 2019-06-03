@@ -151,6 +151,8 @@ def service_catalog(event, function_name):
         response = sc.update_provisioning_artifact()
     elif function_name == 'delete_provisioning_artifact':
         response = sc.delete_provisioning_artifact()
+    elif function_name == 'compare_product_templates':
+        response = sc.compare_product_templates()
     else:
         message = "Function name does not match any function in the handler file."
         logger.info(message)
@@ -167,6 +169,8 @@ def service_control_policy(event, function_name):
         response = scp.list_policies()
     elif function_name == 'list_policies_for_account':
         response = scp.list_policies_for_account()
+    elif function_name == 'list_policies_for_ou':
+        response = scp.list_policies_for_ou()
     elif function_name == 'create_policy':
         response = scp.create_policy()
     elif function_name == 'update_policy':
@@ -207,6 +211,35 @@ def service_control_policy(event, function_name):
         response = scp.detach_policy_from_all_accounts()
     elif function_name == 'enable_policy_type':
         response = scp.enable_policy_type()
+    elif function_name == 'configure_count_2':
+        ou_list = event.get('ResourceProperties').get('OUList', [])
+        logger.info("List of OUs: {}".format(ou_list))
+        event.update({'Index': 0})
+        event.update({'Step': 1})
+        event.update({'Count': len(ou_list)})
+        return event
+    elif function_name == 'iterator2':
+        index = event.get('Index')
+        step = event.get('Step')
+        count = event.get('Count')
+        ou_list = event.get('ResourceProperties').get('OUList', [])
+        ou_map = ou_list[index] if len(ou_list) > index else None
+
+        if index < count:
+            _continue = True
+        else:
+            _continue = False
+
+        index = index + step
+
+        event.update({'Index': index})
+        event.update({'Step': step})
+        event.update({'Continue': _continue})
+        if ou_map:
+            event.update({'OUName': ou_map[0]})
+            event.update({'Operation': ou_map[1]})
+        return event
+
     else:
         message = "Function name does not match any function in the handler file."
         logger.info(message)
